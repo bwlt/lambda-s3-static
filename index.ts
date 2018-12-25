@@ -33,8 +33,6 @@ type InvocationError = {
 
 type EffError = AWSError | InvocationError
 
-type Effect = Task<Response>
-
 const awsError: (error: AWS.AWSError) => AWSError = error => ({
   type: 'AWSError',
   error,
@@ -106,51 +104,61 @@ const mapGetObjectOutputToResponse: (
   return oResponse
 }
 
-const liftedMapGetObjectOutputToResponse: (
-  getObjectOutput: AWS.S3.GetObjectOutput
-) => TaskEither<EffError, Response> = getObjectOutput =>
-  fromEither(
-    fromOption(invocationError('Unexpected getObjectOutput'))(
-      mapGetObjectOutputToResponse(getObjectOutput)
+const getObjectOutputToResponse: (
+  ma: TaskEither<EffError, AWS.S3.GetObjectOutput>
+) => TaskEither<EffError, Response> = ma =>
+  ma.chain(getObjectOutput =>
+    fromEither(
+      fromOption(invocationError('Unexpected getObjectOutput'))(
+        mapGetObjectOutputToResponse(getObjectOutput)
+      )
     )
   )
 
-const getObjectOutputFromLambdaEvent = compose(
+const handleAccessDeniend = (
+  ma: TaskEither<EffError, Response>
+): TaskEither<EffError, Response> =>
+  ma.orElse(effError => {
+    const of: (response: Response) => TaskEither<EffError, Response> =
+      taskEither.of
+    const leftError: TaskEither<EffError, Response> = fromLeft(effError)
+    switch (effError.type) {
+      case 'AWSError': {
+        const awsError = effError.error
+        switch (awsError.code) {
+          case 'AccessDenied':
+            return of(notFound)
+          default:
+            return leftError
+        }
+      }
+      default:
+        return leftError
+    }
+  })
+
+const logError = (
+  ma: TaskEither<EffError, Response>
+): TaskEither<EffError, Response> => {
+  const fromIO_: <A>(ma: IO<A>) => TaskEither<EffError, A> = fromIO
+  return ma.orElse(effError =>
+    fromIO_(C.error(effError)).chain(() => fromLeft(effError))
+  )
+}
+
+const handleLeft = (ma: TaskEither<EffError, Response>): Task<Response> =>
+  ma.fold(() => internalLambdaErrorResponse, identity)
+
+const unsafeRunTask: (ma: Task<Response>) => Promise<Response> = ma => ma.run()
+
+const handler: (event: APIGatewayProxyEvent) => Promise<Response> = compose(
+  unsafeRunTask,
+  handleLeft,
+  logError,
+  handleAccessDeniend,
+  getObjectOutputToResponse,
   getObjectEffect,
   mapLambdaEventToBucketKey
 )
-
-const fromIO_: <A>(ma: IO<A>) => TaskEither<EffError, A> = fromIO
-
-const effectFromEvent: (event: APIGatewayProxyEvent) => Effect = event =>
-  getObjectOutputFromLambdaEvent(event)
-    .chain(liftedMapGetObjectOutputToResponse)
-    .orElse(effError => {
-      const of: (response: Response) => TaskEither<EffError, Response> =
-        taskEither.of
-      const leftError: TaskEither<EffError, Response> = fromLeft(effError)
-      switch (effError.type) {
-        case 'AWSError': {
-          const awsError = effError.error
-          switch (awsError.code) {
-            case 'AccessDenied':
-              return of(notFound)
-            default:
-              return leftError
-          }
-        }
-        default:
-          return leftError
-      }
-    })
-    .orElse(effError =>
-      fromIO_(C.error(effError)).chain(() => fromLeft(effError))
-    )
-    .fold(() => internalLambdaErrorResponse, identity)
-
-const unsafeRunTask: <A>(ma: Task<A>) => Promise<A> = ma => ma.run()
-
-const handler: (event: APIGatewayProxyEvent) => Promise<Response> = event =>
-  unsafeRunTask(effectFromEvent(event))
 
 export { handler }
