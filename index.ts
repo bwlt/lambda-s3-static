@@ -1,3 +1,4 @@
+import path from 'path'
 import * as AWS from 'aws-sdk'
 import { APIGatewayProxyEvent } from 'aws-lambda'
 import {
@@ -10,7 +11,7 @@ import {
 } from 'fp-ts/lib/TaskEither'
 import { fromNullable, Option } from 'fp-ts/lib/Option'
 import { fromOption, Either } from 'fp-ts/lib/Either'
-import { task, Task } from 'fp-ts/lib/Task'
+import { Task } from 'fp-ts/lib/Task'
 import * as C from 'fp-ts/lib/Console'
 import { compose, identity } from 'fp-ts/lib/function'
 import { IO } from 'fp-ts/lib/IO'
@@ -73,14 +74,65 @@ const eBucket: Either<EffError, string> = fromOption(
   invocationError('Missing BUCKET env')
 )(oBucket)
 
+const matchEffError = (effError: EffError) => <R>(matcher: {
+  whenAccessDenied: (awsError: AWS.AWSError) => R
+  genericAWSError: (awsError: AWS.AWSError) => R
+  genericInvocationError: (message: string) => R
+}) => {
+  switch (effError.type) {
+    case 'AWSError': {
+      const awsError = effError.error
+      switch (awsError.code) {
+        case 'AccessDenied':
+          return matcher.whenAccessDenied(awsError)
+        default:
+          return matcher.genericAWSError(awsError)
+      }
+    }
+    case 'InvocationError':
+      return matcher.genericInvocationError(effError.message)
+  }
+}
+
 const getObjectEffect: (
   key: string
-) => TaskEither<EffError, AWS.S3.GetObjectOutput> = key =>
-  new TaskEither(task.of(eBucket)).chain(bucket =>
-    s3GetObject({ Key: key, Bucket: bucket }).mapLeft(awsError)
+) => TaskEither<EffError, AWS.S3.GetObjectOutput> = key => {
+  const key1 = key
+  const key2 = path.join(key, 'index.html') // key to try when key 1 is not found
+  const getObject = (key: string) =>
+    fromEither(eBucket).chain(bucket =>
+      s3GetObject({ Key: key, Bucket: bucket }).mapLeft(awsError)
+    )
+  const getKey2ifKey1IsDirectory: (
+    ma: TaskEither<EffError, AWS.S3.GetObjectOutput>
+  ) => TaskEither<EffError, AWS.S3.GetObjectOutput> = ma =>
+    ma.chain(a => {
+      switch (a.ContentType) {
+        case 'application/x-directory':
+          return getObject(key2)
+        default:
+          return taskEither.of(a)
+      }
+    })
+  const getKey2IfKey1IsNotFound: (
+    ma: TaskEither<EffError, AWS.S3.GetObjectOutput>
+  ) => TaskEither<EffError, AWS.S3.GetObjectOutput> = ma =>
+    ma.orElse(l =>
+      matchEffError(l)({
+        whenAccessDenied: () => getObject(key2),
+        genericAWSError: () => fromLeft(l),
+        genericInvocationError: () => fromLeft(l),
+      })
+    )
+  const f = compose(
+    getKey2IfKey1IsNotFound,
+    getKey2ifKey1IsDirectory,
+    getObject
   )
+  return f(key1)
+}
 
-const mapLambdaEventToBucketKey = (event: APIGatewayProxyEvent) =>
+const mapLambdaEventToBucketKey = (event: APIGatewayProxyEvent): string =>
   event.path.slice(1)
 
 const create200Response = (body: string) => (contentType: string) => (
@@ -122,19 +174,11 @@ const handleAccessDeniend = (
     const of: (response: Response) => TaskEither<EffError, Response> =
       taskEither.of
     const leftError: TaskEither<EffError, Response> = fromLeft(effError)
-    switch (effError.type) {
-      case 'AWSError': {
-        const awsError = effError.error
-        switch (awsError.code) {
-          case 'AccessDenied':
-            return of(notFound)
-          default:
-            return leftError
-        }
-      }
-      default:
-        return leftError
-    }
+    return matchEffError(effError)({
+      whenAccessDenied: () => of(notFound),
+      genericAWSError: () => leftError,
+      genericInvocationError: () => leftError,
+    })
   })
 
 const logError = (
